@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ft6"
+version = "0.1.0"
+description = "6-axis force/torque sensor (Stewart platform, 6 HX711 load cells)"
+requires-python = ">=3.10"
+dependencies = ["numpy", "pyserial", "PySide6", "pyqtgraph"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+ft6 = "ft6.cli:main"
+ft6-gui = "ft6.gui:main"
+
+[tool.setuptools]
+packages = ["ft6"]
+
+[tool.setuptools.package-data]
+ft6 = ["*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
