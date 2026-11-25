@@ -141,13 +141,13 @@ class FakeDevice(_Source):
     """Synthesises frames from a known C_true: raw = C_true^-1 w + tare_true + noise."""
 
     def __init__(self, rate: float = 80.0, noise: float = 20.0, seed: int = 0,
-                 C_true=None, tare_true=None, wrench_fn=None) -> None:
+                 C_true=None, tare_true=None, wrench_fn=None, crosstalk: float = 0.02) -> None:
         super().__init__()
         rng = np.random.default_rng(seed)
         self.rng = rng
         if C_true is None:  # geometry guess with +-10% gains and 2% crosstalk
             C0 = Calibration.from_geometry(Geometry.load()).C
-            C_true = C0 @ np.diag(1 + 0.1 * rng.standard_normal(6)) @ (np.eye(6) + 0.02 * rng.standard_normal((6, 6)))
+            C_true = C0 @ np.diag(1 + 0.1 * rng.standard_normal(6)) @ (np.eye(6) + crosstalk * rng.standard_normal((6, 6)))
         self.C_true = np.asarray(C_true, float)
         self.tare_true = np.round(rng.uniform(-2e5, 2e5, 6)) if tare_true is None else np.asarray(tare_true, float)
         self.rate, self.noise = rate, noise

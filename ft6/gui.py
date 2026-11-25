@@ -12,7 +12,8 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets
 
 from . import calib as C
-from .device import open_device
+from . import session as S
+from .device import FakeDevice, open_device
 
 COLORS = ["#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4", "#008080"]
 WINDOW_S = 10.0
@@ -28,84 +29,169 @@ def make_plot(title, unit, names, colors):
 
 
 class CalibDialog(QtWidgets.QDialog):
-    """One row per load case: mass, application point, direction. Capture each,
-    then Fit. Needs a tare taken at no load first."""
-    COLS = ["mass kg", "x mm", "y mm", "z mm", "dx", "dy", "dz", "captured"]
+    """GUI for a calibration Session (same file and steps as `ft6 calib ...`)."""
+    COLS = ["mass kg", "x mm", "y mm", "z mm", "dx", "dy", "dz", "label", "captured"]
 
-    def __init__(self, win: "MainWindow") -> None:
+    def __init__(self, win: "MainWindow", session_path=S.DEFAULT_SESSION) -> None:
         super().__init__(win)
-        self.win, self.raws = win, {}
+        self.win, self.result = win, None
+        self.ses = S.Session.load(session_path)
         self.setWindowTitle("Calibration")
-        self.resize(760, 480)
+        self.resize(900, 600)
         lay = QtWidgets.QVBoxLayout(self)
-        lay.addWidget(QtWidgets.QLabel(
-            "1) Unload the sensor and press Tare in the main window.\n"
-            "2) Per row: hang the mass at the point (sensor frame, mm) pulling along the\n"
-            "   direction (default gravity, 0 0 -1; use a pulley for horizontal / torque cases),\n"
-            "   let it settle, select the row, Capture. Use 12-20 varied cases covering all 6 axes."))
+        top = QtWidgets.QHBoxLayout()
+        top.addWidget(QtWidgets.QLabel("Mode:"))
+        self.mode = QtWidgets.QComboBox()
+        for k, v in S.MODES.items():
+            self.mode.addItem(v, k)
+        self.mode.setCurrentIndex(list(S.MODES).index(self.ses.mode))
+        self.mode.currentIndexChanged.connect(self.set_mode)
+        top.addWidget(self.mode, 1)
+        lay.addLayout(top)
+        plan = QtWidgets.QHBoxLayout()
+        plan.addWidget(QtWidgets.QLabel("Plan: mass kg"))
+        self.p_mass = QtWidgets.QDoubleSpinBox(decimals=4, minimum=0.001, maximum=50, value=0.5)
+        plan.addWidget(self.p_mass)
+        plan.addWidget(QtWidgets.QLabel("radius mm"))
+        self.p_rad = QtWidgets.QDoubleSpinBox(decimals=1, minimum=0, maximum=1000, value=40)
+        plan.addWidget(self.p_rad)
+        plan.addWidget(QtWidgets.QLabel("points"))
+        self.p_n = QtWidgets.QSpinBox(minimum=3, maximum=24, value=6)
+        plan.addWidget(self.p_n)
+        b = QtWidgets.QPushButton("Add plan (centre + circle)")
+        b.clicked.connect(self.add_plan)
+        plan.addWidget(b)
+        plan.addStretch(1)
+        lay.addLayout(plan)
+        self.prompt = QtWidgets.QLabel()
+        self.prompt.setWordWrap(True)
+        self.prompt.setStyleSheet("font: bold 16px; padding: 8px; background: #fff3c4; color: #222")
+        lay.addWidget(self.prompt)
         self.table = QtWidgets.QTableWidget(0, len(self.COLS))
         self.table.setHorizontalHeaderLabels(self.COLS)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.itemChanged.connect(self.edited)
+        self.table.itemSelectionChanged.connect(self.refresh_prompt)
         lay.addWidget(self.table)
         row = QtWidgets.QHBoxLayout()
-        for text, fn in [("Add case", self.add_row), ("Remove", self.remove_row),
-                         ("Capture selected (2 s)", self.capture), ("Fit", self.do_fit),
-                         ("Save && apply", self.save)]:
+        for text, fn in [("Tare (sensor empty)", self.tare), ("Add case", self.add_row), ("Remove", self.remove_row),
+                         ("Capture (2 s)", self.capture), ("Clear captures", self.clear),
+                         ("Fit", self.do_fit), ("Save && apply", self.save)]:
             b = QtWidgets.QPushButton(text.replace("&&", "&"))
             b.clicked.connect(fn)
             row.addWidget(b)
         lay.addLayout(row)
         self.out = QtWidgets.QPlainTextEdit(readOnly=True)
-        self.out.setMaximumHeight(150)
+        self.out.setMaximumHeight(170)
         lay.addWidget(self.out)
-        self.result = None
-        self.add_row()
+        self.reload()
 
-    def add_row(self, vals=None) -> None:
-        r = self.table.rowCount()
-        self.table.insertRow(r)
-        for c, v in enumerate(vals or ["1.0", "0", "0", "0", "0", "0", "-1"]):
-            self.table.setItem(r, c, QtWidgets.QTableWidgetItem(str(v)))
-        item = QtWidgets.QTableWidgetItem("-")
-        item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
-        self.table.setItem(r, 7, item)
+    # -- table <-> session
+    def reload(self, select=None) -> None:
+        self.table.blockSignals(True)
+        self.table.setRowCount(0)
+        for c in self.ses.cases:
+            r = self.table.rowCount()
+            self.table.insertRow(r)
+            vals = [c.mass_kg, *c.point_mm, *c.direction, c.label, f"ok ({c.n})" if c.captured else "-"]
+            for k, v in enumerate(vals):
+                it = QtWidgets.QTableWidgetItem(f"{v:g}" if isinstance(v, float) else str(v))
+                if k == 8:
+                    it.setFlags(it.flags() & ~QtCore.Qt.ItemIsEditable)
+                self.table.setItem(r, k, it)
+        self.table.blockSignals(False)
+        nxt = self.ses.next_index() if select is None else select
+        if nxt is not None and nxt < self.table.rowCount():
+            self.table.selectRow(nxt)
+        self.refresh_prompt()
+
+    def refresh_prompt(self) -> None:
+        r = self.table.currentRow()
+        i = r if 0 <= r < len(self.ses.cases) and not self.ses.cases[r].captured else None
+        txt = self.ses.prompt(i)
+        if not np.any(self.win.calib.tare):
+            txt = "Step 1: take everything off the sensor and press Tare. " + txt
+        self.prompt.setText(txt)
+
+    def edited(self, item) -> None:
+        r, c = item.row(), item.column()
+        case = self.ses.cases[r]
+        try:
+            if c == 0:
+                case.mass_kg = float(item.text())
+            elif c <= 3:
+                case.point_mm[c - 1] = float(item.text())
+            elif c <= 6:
+                case.direction[c - 4] = float(item.text())
+            elif c == 7:
+                case.label = item.text()
+        except ValueError:
+            self.out.setPlainText("not a number")
+            return
+        case.raw, case.n = None, 0  # the load changed: recapture
+        self.ses.save()
+        self.reload(select=r)
+
+    def set_mode(self) -> None:
+        self.ses.mode = self.mode.currentData()
+        self.ses.save()
+        self.refresh_prompt()
+
+    def add_plan(self) -> None:
+        self.ses.plan_vertical(self.p_mass.value(), self.p_rad.value(), self.p_n.value())
+        self.ses.save()
+        self.reload()
+
+    def add_row(self) -> None:
+        self.ses.add(self.p_mass.value(), [0, 0, 0])
+        self.ses.save()
+        self.reload(select=len(self.ses.cases) - 1)
 
     def remove_row(self) -> None:
         r = self.table.currentRow()
         if r >= 0:
-            self.table.removeRow(r)
-            self.raws = {k - (k > r): v for k, v in self.raws.items() if k != r}
+            self.ses.remove(r)
+            self.ses.save()
+            self.reload()
 
-    def wrench_of(self, r: int) -> np.ndarray:
-        v = [float(self.table.item(r, c).text()) for c in range(7)]
-        return C.wrench_from_mass(v[0], v[1:4], v[4:7])
+    def clear(self) -> None:
+        self.ses.clear_captures()
+        self.ses.save()
+        self.reload()
 
+    def tare(self) -> None:
+        self.win.tare()
+        self.refresh_prompt()
+
+    # -- capture / fit
     def capture(self) -> None:
         r = self.table.currentRow()
         if r < 0:
+            r = self.ses.next_index()
+        if r is None:
             return
-        try:
-            self.wrench_of(r)
-        except ValueError:
-            self.out.setPlainText("row has a non-numeric value")
-            return
-        self.table.item(r, 7).setText("capturing...")
-        idx = self.win.dev.buffer.total
+        self.table.item(r, 8).setText("capturing...")
+        dev = self.win.dev
+        if isinstance(dev, FakeDevice):
+            dev.set_wrench(self.ses.cases[r].wrench())
+        idx0 = dev.buffer.total
 
         def done():
-            _, rows = self.win.dev.buffer.read_since(idx)
+            _, rows = dev.buffer.read_since(idx0)
+            rows = rows[len(rows) // 5:]  # drop the first 20 % (settling)
             if len(rows):
-                self.raws[r] = rows[:, 1:].mean(0)
-                self.table.item(r, 7).setText(f"ok ({len(rows)} samples)")
+                self.ses.set_raw(r, rows[:, 1:].mean(0), len(rows))
+                self.ses.save()
+                self.reload()
             else:
-                self.table.item(r, 7).setText("no data")
-        QtCore.QTimer.singleShot(2000, done)
+                self.table.item(r, 8).setText("no data")
+        QtCore.QTimer.singleShot(self.capture_ms, done)
+
+    capture_ms = 2000
 
     def do_fit(self) -> None:
-        rows = sorted(self.raws)
         try:
-            cal, rep = C.fit([self.raws[r] for r in rows], [self.wrench_of(r) for r in rows],
-                             self.win.calib.tare)
+            cal, rep = self.ses.fit(self.win.calib.tare)
         except ValueError as e:
             self.out.setPlainText(f"cannot fit: {e}")
             return
@@ -164,6 +250,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timer.start(50)
 
     def tare(self) -> None:
+        if isinstance(self.dev, FakeDevice):  # simulated sensor: unload it, tare from no-load samples
+            self.dev.set_wrench(np.zeros(6))
+            self.calib.tare = self.dev.synth(np.zeros(6), 40).mean(0)
+            self.calib.save(self.calib_path)
+            self.status.setText("tared")
+            return
         rows = self.dev.buffer.latest(40)
         if len(rows):
             self.calib.tare = rows[:, 1:].mean(0)

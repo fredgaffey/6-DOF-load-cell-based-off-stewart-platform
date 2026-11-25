@@ -54,11 +54,17 @@ Leg geometry is `ft6/default_geometry.json` (base and top joint coordinates in m
 
 ### Calibration procedure
 
-1. Unload the sensor, press Tare (or `ft6 tare`).
-2. Open Calibrate. For each load case hang a known mass at a known point (mm, sensor frame) and give the pull direction (default gravity, 0 0 -1). Vertical masses alone only excite Fz, Mx, My; add cases through a pulley (horizontal string direction) to excite Fx, Fy, Mz. Use 12-20 varied cases.
-3. Select the row, Capture (2 s average), repeat. Fit gives per-axis residuals; Save and apply writes `C`, tare and metadata as JSON.
+The GUI (Calibrate...) and the CLI (`ft6 calib ...`) drive the same session file (`~/.config/ft6/session.json`), with the same steps and prompts; `ft6 --help` maps each GUI button to its command.
 
-The fit is a least-squares 6x6 C with wrench = C (raw - tare), so unequal load share between legs is handled.
+**Weights only (mode `gains`, default)** - enough for thrust. Fits one gain per leg; the leg geometry does the rest. Fz, Mx, My are checked by the cases; Fx, Fy, Mz (torque) rely on the geometry file being right.
+
+    ft6 calib new --mode gains
+    ft6 calib plan --mass 0.5 --radius 40     # centre + 6 points on a 40 mm circle (+x first)
+    ft6 calib wizard                          # tare, then prompts "put 500.0 g at x=... y=..." per case, fits, asks to save
+
+or step by step: `ft6 tare`, `ft6 calib capture` (repeat; prints the next prompt), `ft6 calib fit --save`. Known masses: water (1 mL = 1 g), a kitchen scale, or AU coins ($1 9.00 g, $2 6.60 g, 50c 15.55 g, 20c 11.30 g). Use 2-3 different masses to check linearity. A leg misfit above 5 % in the report means that leg or the geometry needs checking.
+
+**Full 6x6 (mode `full`)** - adds sideways string pulls over a pulley (`ft6 calib add --mass M --at X Y Z --dir DX DY DZ`), 12-20 cases covering all six axes.
 
 ### Data format
 

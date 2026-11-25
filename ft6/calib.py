@@ -45,11 +45,18 @@ class FitReport:
     cond: float  # condition number of the load-case matrix
     n_cases: int
     residuals: np.ndarray = field(repr=False, default=None)
+    gains: np.ndarray | None = None  # gains mode: N per count per leg
+    leg_err: np.ndarray | None = None  # gains mode: per-leg rms misfit / rms leg force
 
     def text(self) -> str:
         lines = [f"{self.n_cases} load cases, raw-matrix cond {self.cond:.1f}"]
         for a, u, r, m in zip(AXES, UNITS, self.rms, self.max_abs):
             lines.append(f"  {a}: rms {r:.4g} {u}, max {m:.4g} {u}")
+        if self.gains is not None:
+            lines.append("  leg gains (N/count) and misfit:")
+            for i, (k, e) in enumerate(zip(self.gains, self.leg_err)):
+                flag = "  <- check this leg / geometry" if e > 0.05 else ""
+                lines.append(f"    leg{i + 1}: {k:.4g}  misfit {100 * e:.1f} %{flag}")
         return "\n".join(lines)
 
 
@@ -108,3 +115,35 @@ def fit(raws, wrenches, tare) -> tuple[Calibration, FitReport]:
                     float(np.linalg.cond(X)), len(X), res)
     meta = {"source": "fit", "n_cases": len(X), "rms": rep.rms.tolist()}
     return Calibration(Ct.T, tare, meta), rep
+
+
+def fit_gains(raws, wrenches, tare, geom: Geometry) -> tuple[Calibration, FitReport]:
+    """Weights-only calibration: C = W diag(k), one gain k_i (N/count) per leg.
+
+    The geometry gives each leg's force for a known load (f = W^-1 w), so each case
+    yields k_i = f_i / (raw_i - tare_i) for every leg; least squares over the cases.
+    Vertical masses at several points load every (inclined) leg, so they suffice.
+    Thrust (Fz), Mx, My are checked by the cases; Fx, Fy, Mz come from geometry."""
+    X = np.asarray(raws, float) - np.asarray(tare, float)
+    Wr = np.asarray(wrenches, float)
+    if X.ndim != 2 or X.shape[1] != 6 or X.shape != Wr.shape or len(X) < 1:
+        raise ValueError("raw and wrench must both be (N,6)")
+    Wg = geom.W()
+    F = np.linalg.solve(Wg, Wr.T).T  # leg forces per case (N,6)
+    fs = np.sqrt((F ** 2).mean(0))
+    if fs.max() == 0:
+        raise ValueError("the load cases put no load on the sensor")
+    if np.any(fs < 1e-3 * fs.max()):
+        raise ValueError(f"legs {[i + 1 for i in np.where(fs < 1e-3 * fs.max())[0]]} carry no load in these cases")
+    xx = (X * X).sum(0)
+    if np.any(xx == 0):
+        raise ValueError("a leg reads exactly tare in every case: check its wiring")
+    k = (F * X).sum(0) / xx
+    Cm = Wg @ np.diag(k)
+    res = X @ Cm.T - Wr
+    leg_err = np.sqrt(((F - X * k) ** 2).mean(0)) / fs
+    rep = FitReport(np.sqrt((res ** 2).mean(0)), np.abs(res).max(0), float(np.linalg.cond(X)) if len(X) >= 6 else float("nan"),
+                    len(X), res, k, leg_err)
+    meta = {"source": "fit_gains", "n_cases": len(X), "k": k.tolist(), "rms": rep.rms.tolist(),
+            "note": "weights only: Fz, Mx, My checked; Fx, Fy, Mz from geometry"}
+    return Calibration(Cm, tare, meta), rep
